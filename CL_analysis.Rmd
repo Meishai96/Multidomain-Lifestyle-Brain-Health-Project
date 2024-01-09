@@ -1,0 +1,114 @@
+---
+title: "CL_analysis"
+author: "Meishan"
+date: '2023-05-03'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(psych)
+library(nlme)
+library(fpc)
+```
+# ####this is an example code of performing clustering on lifestyle behaviors: exercise, cognitive activity, diet, social####
+# regress out covariates for your variables (optional, many papers also do not regress out)
+```{r}
+#get the name of variables
+varlist<- names(Lifestyle)
+# this renaming is easier for plotting
+new_varlist <- c("exercise engagement","cognitive activity","social network","healthy diet adherence")
+#compute the residuals
+models <- lapply(varlist, function(x) {
+  lm(substitute(i ~ age + sex + APOE4_status + Education_years, list(i = as.name(x))), data = df)
+})
+list_resid = lapply(models, resid)  
+#combine multiple lists into table
+df_resid = do.call(cbind, list_resid)
+df_resid <- as_tibble(df_resid)
+#change the variable names
+curnames <-names(df_resid)
+LS_resid <- df_resid %>% rename_at(vars(curnames), ~ new_varlist)
+# Now you should have a table with residual scores across all lifestyle variables
+
+```
+
+# running k-means based on residual scores
+```{r}
+# run across multiple sizes of k
+set.seed(123)
+kclusts <- 
+  tibble(k = 1:9) %>%
+  mutate(
+    kclust = map(k, ~kmeans(LS_resid, .x)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    augmented = map(kclust, augment, LS_resid)
+  )
+
+kclusts
+```
+
+# summary outcomes
+```{r}
+# tidy output across k sizes
+clusters <- 
+  kclusts %>%
+  unnest(cols = c(tidied))
+
+assignments <- 
+  kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+```
+
+#scree plot for within-cluster sum of squares, if you need to report it
+```{r}
+
+ggplot(clusterings, aes(k, tot.withinss)) +
+  geom_line() +
+  geom_point() + scale_x_continuous(name="K",limits = c(1,9), breaks = c(1:9))+theme(axis.text.x=element_text(size=15), axis.title.x = element_text(size=20), axis.text.y = element_text(size = 15), axis.title.y = element_text(size=20)) 
+
+```
+
+#choose a final k based on the scree plot
+```{r}
+#I decided cluster=2 based on the plot
+set.seed(758)
+final_clust2 <- kmeans(LS_resid, centers = 2)
+# now you have the final cluster labels for each participants
+final_clust2
+# #### below  is to plot lifestyle scores by cluster groups
+#1 combine lifestyle scores and clustering results
+sd <- cbind(LS_resid,cluster=final_clust2$cluster) %>% aggregate(.~cluster, data=., FUN = "sd") %>% pivot_longer(!cluster, names_to = "scale", values_to = "sd")
+#2 create df of center of clusters values
+centers <- as_tibble(final_clust2[["centers"]])
+centers$cluster = c(1,2)
+
+#reshape the data for plotting
+centers_long <- centers %>%
+  pivot_longer(!cluster, names_to = "scale", values_to = "score")
+
+centers_long$cluster <- as.factor(centers_long$cluster)
+centers_long$sd <- sd$sd
+# plot out
+ggplot(centers_long) +
+  geom_bar( aes(x=scale, y=score, fill=cluster), stat="identity", alpha=0.5, position = position_dodge()) +
+  geom_errorbar(aes(scale, ymin=score-sd, ymax=score+sd), width=.2,
+                 position=position_dodge(.9))
+
+```
+
+#bootstrap k-means to evaluate the stability of your clusters
+```{r}
+# swap k for each cluster number to evaluate for each number of k
+clustBoot <- clusterboot(LS_resid, B = 100,
+                         clustermethod = kmeansCBI,
+                         k = 2, seed = 12345,
+                         showplots = FALSE)
+clustBoot # gives jaccard index (if higher then higher stability it is)
+```

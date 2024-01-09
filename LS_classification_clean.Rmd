@@ -1,0 +1,373 @@
+---
+title: "Lifestyle classification and pos-hoc analysis"
+author: "Meishan Ai"
+date: '2023-06-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# loading all required packages
+library(dplyr)
+library(readr)
+library(pROC)
+library(ROCit)
+library(selectiveInference)
+library(glmnet)
+library(caret)
+library(tidyverse)
+library(gam)
+library(penalized)
+library(pensim)
+library(randomForest)
+library(rsample)
+library(data.table)
+library(tidymodels)
+```
+
+#Import the dataset
+```{r}
+data <- read_csv("/PATH/all_class_img_id.csv")
+```
+
+# regress out age, gender and meanFD from imaging data (No longer need to do this) 
+```{r}
+# NOTE: must change train.data_x in certain places to correspond to each each dataset you are controlling for and must change formula for fmri vs structural models
+varlist <- names(data)[3:204] # creates var name list (for both func and structural)
+models <- lapply(varlist, function(x) {
+  lm(substitute(i ~ age + sex + apoe4 + edu + MeanMotion, list(i = as.name(x))), data = data)
+})
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+#fmri <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+struct <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+# put back together
+#imaging1 <- struct
+imaging1 <- cbind(fmri, struct)
+imaging1['kmeans_2'] <- data$kmeans_2 # append adherence
+imaging1$kmeans_2 <- as.factor(imaging1$kmeans_2)
+
+#new kmeans results from small behavioral-imaging sample=139
+imaging1b <- cbind(fmri, struct)
+imaging1b['kmeans_2']<- all_img_id$kmeans_2
+imaging1b$kmeans_2 <- as.factor(imaging1b$kmeans_2)
+```
+
+# impute missing values in behavioral dataset
+```{r}
+behavior <- data %>% select(age, education, sex, exercise)
+varlist <- names(behavior)
+for (var in varlist){
+   if(sum(is.na(behavior[,var]))>0){
+   behavior[,var][is.na(behavior[,var])]<- median(behavior[,var], na.rm=TRUE)
+}
+}
+
+```
+# regress out age, sex, apoe4 from behavioral data (No longer need to do this)
+```{r}
+varlist <- names(LS_class_behavior)[7:39]
+models <- lapply(varlist, function(x) {
+  lm(substitute(i ~ age + sex + apoe4, list(i = as.name(x))), data = LS_class_behavior)
+})
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+
+df_resid <- as_tibble(df_resid, .name_repair = "unique")
+curnames <-names(df_resid)
+
+behavior <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+# put back together
+behavior['kmeans_2'] <- LS_class_behavior$kmeans_2 # append adherence
+behavior$kmeans_2 <- as.factor(behavior$kmeans_2)
+
+```
+# create multimodel dataset (if needed)
+```{r}
+multimodal <- cbind(behavior[,-34], imaging1)
+```
+
+
+# feature reduction 
+```{r}
+set.seed(456) # this needs to be the same seeds as the classification cross-validation
+# run SBF 
+#creates function to select only vars in training set that corr with outcome at p=0.1 (the default caretSBFis 0.05)
+mySBF <- caretSBF
+mySBF$filter <- function(score, x, y) { score <= 0.05 }
+
+
+mdl <- sbf(
+  class ~ .,
+  data = imaging1b, 
+  method = "glm", 
+  family = "binomial",
+  preProc = c("center", "scale"),
+  trControl = trainControl(method = "none"),
+  sbfControl = sbfControl(functions = caretSBF, verbose = FALSE, method = 'cv', number = 10))
+#list selected vars
+selected <- mdl$variables$selectedVars
+
+#create list of features that are correlated with outcome with p<0.05
+sbf_imaging2b <- imaging1b %>% dplyr::select(all_of(selected))
+# scale the features
+sbf_imaging2b <- data.frame(scaled.dat <- scale(sbf_imaging2b))
+# append outcome
+sbf_imaging2b['class'] <- imaging1b$class
+
+```
+
+
+# #####################################    using nestedCV svm in tidymodels    ############################
+#load pacakges
+```{r}
+library(tidymodels)
+library(kernlab)
+library(recipes)
+library(data.table)
+```
+# Resampling 
+# for examples see https://www.tidymodels.org/learn/work/nested-resampling/
+
+```{r}
+# spliting the dataset into train and test sets
+set.seed(456)
+results <- nested_cv(sbf_imaging2b, 
+                     outside = vfold_cv(v=10, strata = "kmeans_2"), 
+                     inside = bootstraps(times = 25))
+```
+
+```{r}
+# `object` will be an `rsplit` object from our `results` tibble
+# `cost` is the tuning parameter
+# this is tuning over the AUC area
+svm_auc <- function(object, cost) {
+  y_col <- ncol(object$data)
+  mod <- 
+    svm_linear(mode = "classification", cost = cost) %>% 
+    set_engine("kernlab") %>% 
+    fit(kmeans_2 ~ ., data = analysis(object))
+  
+  holdout_pred <- 
+    predict(mod, assessment(object) %>% dplyr::select(-kmeans_2)) %>% 
+    bind_cols(assessment(object) %>% dplyr::select(kmeans_2))
+  holdout_pred$.pred_class<-as.numeric(holdout_pred$.pred_class)
+  roc_rs <- roc(response=holdout_pred$kmeans_2, predictor=holdout_pred$.pred_class, levels=c("1","2"),direction="<")
+  auc(roc_rs)
+  #rmse(holdout_pred, truth = y, estimate = .pred)$.estimate
+}
+
+# this is tuning over the accuracy
+svm_err <- function(object, cost = 1) {
+  y_col <- ncol(object$data)
+  mod <- 
+    svm_linear(mode = "classification", cost = cost) %>% 
+    set_engine("kernlab") %>% 
+    fit(kmeans_2 ~ ., data = analysis(object))
+  
+  
+  holdout_pred <- 
+    predict(mod, assessment(object) %>% dplyr::select(-kmeans_2)) %>% 
+    bind_cols(assessment(object) %>% dplyr::select(kmeans_2))
+    mean(holdout_pred$.pred_class!=holdout_pred$kmeans_2)  
+  #rmse(holdout_pred, truth = y, estimate = .pred)$.estimate
+}
+
+# In some case, we want to parameterize the function over the tuning parameter:
+auc_wrapper <- function(cost, object) svm_auc(object, cost)
+err_wrapper <- function(cost, object) svm_err(object, cost)
+```
+# create a set of tuning parameters
+```{r}
+tune_over_cost <- function(object) {
+   tibble(cost = 2 ^ seq(-2, 8, by = 1)) %>% 
+    mutate(ERR = map_dbl(cost, err_wrapper, object = object))
+}
+```
+# wrap up
+```{r}
+summarize_tune_results <- function(object) {
+  # Return row-bound tibble that has the 25 bootstrap results
+  map_df(object$splits, tune_over_cost) %>%
+    # For each value of the tuning parameter, compute the 
+    # average RMSE which is the inner bootstrap estimate. 
+    group_by(cost) %>%
+    summarize(mean_ERR = mean(ERR, na.rm = TRUE),
+              n = length(ERR),
+              .groups = "drop")
+}
+```
+
+# run the tuning fit
+```{r include=FALSE}
+library(furrr)
+plan(multisession)
+
+tuning_results <- future_map(results$inner_resamples, summarize_tune_results, .options=furrr_options(seed=TRUE)) 
+```
+# plot different models and visualize the best ones
+```{r}
+library(scales)
+
+pooled_inner <- tuning_results %>% bind_rows #change
+
+best_cost <- function(dat) dat[which.min(dat$mean_ERR),]
+
+p <- 
+  ggplot(pooled_inner, aes(x = cost, y = mean_ERR)) + 
+  scale_x_continuous(trans = 'log2') +
+  xlab("SVM Cost") + ylab("Inner ERR")
+
+for (i in 1:length(tuning_results)) #change
+  p <- p  +
+  geom_line(data = tuning_results[[i]], alpha = .2) +   #change
+  geom_point(data = best_cost(tuning_results[[i]]), pch = 16, alpha = 3/4)  #change
+
+p <- p + geom_smooth(data = pooled_inner, se = FALSE)
+p
+```
+# getting the best set of parameteres
+```{r}
+#find out the best cost parameters
+cost_vals <- 
+  tuning_results %>% #change
+  map_df(best_cost) %>% 
+  dplyr::select(cost)
+
+results <- #change
+  bind_cols(results, cost_vals) %>%  #change
+  mutate(cost = factor(cost, levels = paste(2 ^ seq(-2, 8, by = 1))))
+
+ggplot(results, aes(x = cost)) + #change
+  geom_bar() + 
+  xlab("SVM Cost") + 
+  scale_x_discrete(drop = FALSE)
+```
+
+
+# using last_fit to get the outter model estimates
+```{r}
+set.seed(456)
+id <- results$id
+cost <- cost_vals
+splits <- results$splits
+#outter <- new_rset(split, id, subclass  = "rset")
+
+svm_outter <- function(object, id, cost) {
+  fit_mod <- svm_linear(mode = "classification", cost = cost) %>% 
+      set_engine("kernlab")
+  fit_rec <- recipe(kmeans_2~., data =sbf_imaging2b) # change here for different models!
+  fit_wf <- workflow() %>%
+    add_recipe(fit_rec) %>%
+    add_model(fit_mod)
+  #class(object) <- append(class(object),"rset")
+  last_fit(fit_wf,object,metrics = metric_set(accuracy, roc_auc, sens, spec)) %>% 
+    replace(.=="train/test split", id) 
+}
+
+# apply the last fit function to the splits
+mod_rs2 <-pmap(list(splits, id, cost), svm_outter) %>% 
+  rbindlist(use.names = TRUE) %>%
+  as_tibble()
+
+setattr(mod_rs2$.metrics, 'names', id)
+#put results all together
+mod_mat <- mod_rs2$.metrics %>% 
+  rbindlist(use.names = TRUE, idcol="model") %>%
+  as_tibble()
+
+# get the averaged performance
+aggregate(.estimate~.metric, data=mod_mat, mean)
+```
+
+# collect the predictions and draw the roc
+```{r}
+
+setattr(mod_rs2$.predictions, 'names', id)
+#get the prediction value and then can compare this to the true value
+mod_pred <- mod_rs2$.predictions %>% 
+  rbindlist(use.names = TRUE, idcol="model") %>%
+  as_tibble()
+#pdf("mod_pre_linearSVM.pdf")
+#plot the ROC curve
+tiff("SVM_md_ROC.tiff", units="in", width=5, height=5, res=300)
+mod_pred %>%
+  #group_by(model) %>%
+  roc_curve(kmeans_2, .pred_1) %>%
+  ggplot(aes(1 - specificity, sensitivity)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_path(show.legend = FALSE, alpha = 0.6, size = 1.2) +
+  coord_equal()
+dev.off()
+```
+
+# get the value of importance
+```{r}
+#define function to extract the weights
+get_coef <- function(wf) {
+  ksvm_obj <- extract_fit_parsnip(wf)$fit
+  coefs <- ksvm_obj@coef[[1]]
+  mat <- ksvm_obj@xmatrix[[1]]
+  var_imp <- coefs %*% mat
+ var_imp_long <- data.frame(var_imp) %>% 
+   gather(feature, imp)%>%
+   mutate(abs(imp)) 
+
+}
+# apply function to get the weights
+svm_imp_img <- lapply(mod_rs2$.workflow, get_coef)
+unlist <- svm_imp_img %>% bind_rows(.id = "column_label") # need to unlist it into a table
+# filter the features with high importance and get the rank order
+svm_imp_img_top30 <- unlist %>% arrange(desc(`abs(imp)`)) %>%
+                                group_by(column_label) %>%
+                                slice(1:30) %>%
+                                mutate(rep(1, 30))
+imp_feat <- aggregate(data=svm_imp_img_top30, `rep(1, 30)`~feature, FUN=sum)#get the frequency of appearance
+imp_feat_mean <- aggregate(data=svm_imp_img_top30, imp~feature, FUN=mean) #mean weights across folds
+imp_feat_80 <- imp_feat[which(imp_feat$`rep(1, 30)`>=8),]%>% merge(imp_feat_mean, by="feature", all.x=TRUE)
+
+```
+
+
+# permutation to get the p value for the classification output
+```{r}
+# Permutes the oberseved vs predicted values 1000 times and outputs a null distribution of predicitons and a p-vlue comparing the actual prediction vs the null distribution: p-value of the permutation test is calculated as the proportion of sampled permutations that are greater or equal to the true prediction correlation.
+set.seed(456)
+#get the prediction value
+mod_preds_tbl<- mod_rs2 %>%
+    dplyr::select(.predictions)
+
+mod_preds <- rbindlist(mod_preds_tbl$.predictions, use.names = TRUE, idcol="model")
+   # group_by(id) %>%
+   # group_map(~rbindlist(.x$.predictions, use.names = TRUE, idcol="model"))
+
+permu_acc <- function(object){
+  null_distribution_simulated <- object %>%
+  specify(response = kmeans_2, success="2", explanatory = .pred_class) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  group_by(replicate) %>%
+  yardstick::accuracy(truth=kmeans_2, estimate=.pred_class) %>%
+  dplyr::select(.estimate)
+
+  
+  obs_acc <- object %>%
+   specify(response = kmeans_2, success = "2", explanatory = .pred_class) %>%
+   yardstick::accuracy(truth=kmeans_2, estimate=.pred_class) %>%
+   dplyr::select(.estimate)
+
+  sum(null_distribution_simulated>= obs_acc[[1]])/1000
+}
+
+permu_acc(mod_preds)
+```
+
+
+
